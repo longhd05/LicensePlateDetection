@@ -1,56 +1,68 @@
 import re
 
-def fix_ocr_errors(plate):
 
-    if len(plate) < 3:
-        return plate
+def clean_text(text):
+    text = text.upper()
+    text = re.sub(r'[^A-Z0-9]', '', text)
+    return text
 
-    plate = list(plate)
 
-    # vị trí thứ 3 phải là chữ cái
-    confusion_map = {
-        '0': 'D',
-        '8': 'B',
-        '5': 'S',
-        '2': 'Z',
-        '6': 'G'
-    }
+def parse_plate(texts):
 
-    if plate[2].isdigit():
-        plate[2] = confusion_map.get(plate[2], plate[2])
+    texts = [clean_text(t) for t in texts]
 
-    return "".join(plate)
+    # -----------------
+    # 1. tìm biển 1 dòng
+    # -----------------
 
-def format_plate(texts):
+    for t in texts:
 
-    plate = "".join(texts).upper()
+        match = re.search(r'\d{2}[A-Z]{1,2}\d{4,5}', t)
 
-    # bỏ ký tự lạ
-    plate = re.sub(r'[^A-Z0-9]', '', plate)
+        if match:
+            p = match.group()
 
-    # sửa lỗi OCR
-    plate = fix_ocr_errors(plate)
+            province = p[:2]
+            numbers = p[-5:]
+            series = p[2:-5]
 
-    pattern = r'\d{2}(?:[A-Z]{2}|[A-Z]\d|[A-Z])\d{4,5}'
+            return f"{province}{series}-{numbers}"
 
-    match = re.search(pattern, plate)
+    # -----------------
+    # 2. tìm cụm số
+    # -----------------
 
-    if not match:
+    numbers = None
+
+    for t in texts:
+
+        match = re.search(r'\d{4,5}', t)
+
+        if match:
+            numbers = match.group()
+            break
+
+    if not numbers:
         return None
 
-    p = match.group()
+    # -----------------
+    # 3. tìm mã tỉnh + series
+    # -----------------
 
-    province = p[:2]
+    series_part = None
 
-    # tìm phần series
-    if re.match(r'\d{2}[A-Z]{2}', p):
-        series = p[2:4]
-        numbers = p[4:]
-    elif re.match(r'\d{2}[A-Z]\d', p):
-        series = p[2:4]
-        numbers = p[4:]
-    else:
-        series = p[2:3]
-        numbers = p[3:]
+    for t in texts:
+
+        match = re.search(r'\d{2}[A-Z0-9]{1,2}', t)
+
+        if match:
+            series_part = match.group()
+            break
+
+    if not series_part:
+        return None
+
+    province = series_part[:2]
+    series = series_part[2:]
 
     return f"{province}{series}-{numbers}"
