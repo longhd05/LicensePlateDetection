@@ -541,6 +541,7 @@ defaults = {
     "uploaded_bytes": None,
     "uploaded_type": None,
     "media_kind": None,
+    "processed_video_bytes": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -586,6 +587,126 @@ def process_image(image, detector, ocr):
         })
 
     return img_cv, results
+
+
+def process_frame(frame_bgr, detector, ocr):
+    plates = detector.detect(frame_bgr)
+    frame_results = []
+
+    for plate_info in plates:
+        bbox = plate_info["bbox"]
+        conf = plate_info["conf"]
+
+        plate_img = crop_plate(frame_bgr, bbox)
+        texts = ocr.read_text(plate_img)
+        plate_number = parse_plate(texts)
+
+        if not plate_number:
+            continue
+
+        frame_results.append({
+            "bbox": bbox,
+            "conf": conf,
+            "raw_ocr": texts,
+            "plate_number": plate_number,
+            "cropped_image": cv2.cvtColor(plate_img, cv2.COLOR_BGR2RGB),
+        })
+
+    return frame_results
+
+
+def process_video(video_bytes, detector, ocr, frame_skip=5):
+    temp_input = "_temp_upload_video"
+    temp_output = "_temp_processed_video.mp4"
+
+    with open(temp_input, "wb") as f:
+        f.write(video_bytes)
+
+    cap = cv2.VideoCapture(temp_input)
+    if not cap.isOpened():
+        if os.path.exists(temp_input):
+            os.remove(temp_input)
+        return [], None
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+
+    writer = None
+    if width > 0 and height > 0:
+        writer = cv2.VideoWriter(
+            temp_output,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            fps,
+            (width, height),
+        )
+
+    best_by_plate = {}
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        if frame_idx % frame_skip == 0:
+            frame_results = process_frame(frame, detector, ocr)
+
+            for item in frame_results:
+                plate_number = item["plate_number"]
+                if plate_number not in best_by_plate or item["conf"] > best_by_plate[plate_number]["conf"]:
+                    best_by_plate[plate_number] = {
+                        **item,
+                        "frame_index": frame_idx,
+                    }
+
+            if writer is not None:
+                frame_for_draw = frame.copy()
+                for item in frame_results:
+                    x1, y1, x2, y2 = item["bbox"]
+                    text = f"{item['plate_number']} ({item['conf']:.2f})"
+                    cv2.rectangle(frame_for_draw, (x1, y1), (x2, y2), (99, 76, 242), 2)
+                    cv2.putText(
+                        frame_for_draw,
+                        text,
+                        (x1, max(y1 - 10, 15)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (99, 76, 242),
+                        2,
+                    )
+                writer.write(frame_for_draw)
+        elif writer is not None:
+            writer.write(frame)
+
+        frame_idx += 1
+
+    cap.release()
+    if writer is not None:
+        writer.release()
+
+    processed_video_bytes = None
+    if os.path.exists(temp_output):
+        with open(temp_output, "rb") as f:
+            processed_video_bytes = f.read()
+        os.remove(temp_output)
+
+    if os.path.exists(temp_input):
+        os.remove(temp_input)
+
+    deduped_results = []
+    for idx, (_, item) in enumerate(sorted(best_by_plate.items(), key=lambda x: x[1]["conf"], reverse=True)):
+        deduped_results.append({
+            "id": idx,
+            "bbox": item["bbox"],
+            "conf": item["conf"],
+            "raw_ocr": item["raw_ocr"],
+            "plate_number": item["plate_number"],
+            "cropped_image": item["cropped_image"],
+            "frame_index": item["frame_index"],
+        })
+
+    return deduped_results, processed_video_bytes
 
 
 def draw_bounding_boxes(img_cv, results, selected_id=None):
@@ -655,6 +776,7 @@ def reset_result_state():
     st.session_state.processed_image = None
     st.session_state.selected_plate = None
     st.session_state.is_processing = False
+    st.session_state.processed_video_bytes = None
 
 
 def save_uploaded_file_state(uploaded_file):
@@ -834,7 +956,7 @@ with st.sidebar:
     uploaded_file = st.file_uploader(
         "Chọn file từ máy",
         type=["jpg", "jpeg", "png", "mp4", "mov", "avi", "mkv"],
-        help="Hỗ trợ ảnh và video. Pipeline backend hiện tại đang xử lý trực tiếp cho ảnh."
+        help="Hỗ trợ ảnh và video. Backend có xử lý nhận diện cho cả 2 loại dữ liệu."
     )
 
     if uploaded_file is not None:
@@ -853,12 +975,9 @@ with st.sidebar:
     start_disabled = st.session_state.uploaded_bytes is None
 
     if st.button("Bắt đầu nhận diện", disabled=start_disabled, use_container_width=True):
-        if st.session_state.media_kind == "video":
-            st.warning("UI đã hỗ trợ upload/preview video. Pipeline backend hiện tại trong app này mới chạy trực tiếp cho ảnh.")
-        else:
-            st.session_state.is_processing = True
-            st.session_state.selected_plate = None
-            st.rerun()
+        st.session_state.is_processing = True
+        st.session_state.selected_plate = None
+        st.rerun()
 
     st.markdown("---")
     st.markdown("### Trạng thái")
@@ -877,7 +996,6 @@ with st.sidebar:
 # =========================
 if (
     st.session_state.uploaded_bytes
-    and st.session_state.media_kind == "image"
     and st.session_state.is_processing
 ):
     render_loading_box()
@@ -885,11 +1003,19 @@ if (
     detector, ocr = load_models()
 
     if detector and ocr:
-        image = get_current_pil_image()
-        img_cv, results = process_image(image, detector, ocr)
+        if st.session_state.media_kind == "video":
+            results, processed_video = process_video(st.session_state.uploaded_bytes, detector, ocr)
+            st.session_state.results = results
+            st.session_state.processed_video_bytes = processed_video
+            st.session_state.processed_image = None
+        else:
+            image = get_current_pil_image()
+            img_cv, results = process_image(image, detector, ocr)
 
-        st.session_state.results = results
-        st.session_state.processed_image = img_cv
+            st.session_state.results = results
+            st.session_state.processed_image = img_cv
+            st.session_state.processed_video_bytes = None
+
         st.session_state.is_processing = False
         st.session_state.selected_plate = 0 if results else None
         st.rerun()
@@ -914,8 +1040,10 @@ else:
     <div class="panel-title">Main content</div>
 </div>
 """, unsafe_allow_html=True)
-        st.video(st.session_state.uploaded_bytes)
-        st.info("Giao diện đã hỗ trợ upload/preview video. Với code backend hiện tại, nhận diện trực tiếp mới áp dụng cho ảnh.")
+        st.video(st.session_state.processed_video_bytes or st.session_state.uploaded_bytes)
+
+        if st.session_state.results:
+            st.success("Đã xử lý video và đánh dấu biển số theo từng frame mẫu.")
     else:
         original_image = get_current_pil_image()
 
@@ -942,3 +1070,5 @@ else:
     elif st.session_state.uploaded_bytes and not st.session_state.is_processing:
         if st.session_state.media_kind == "image" and st.session_state.processed_image is not None:
             st.info("Không phát hiện được biển số nào trong ảnh.")
+        elif st.session_state.media_kind == "video" and st.session_state.processed_video_bytes is not None:
+            st.info("Không phát hiện được biển số nào trong video.")
